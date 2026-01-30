@@ -3,12 +3,32 @@
 const ROOT_ID = "yt-transcript-ext-root";
 let injectedOnce = false;
 let awaitingCapture = false;
+let bootRetryTimer = null;
 
 boot();
 
 // Re-run when YouTube SPA navigates to a new watch page.
-window.addEventListener("yt-navigate-finish", () => boot());
-window.addEventListener("yt-page-data-updated", () => boot());
+window.addEventListener("yt-navigate-finish", () => {
+  clearTimeout(bootRetryTimer);  // Cancel any pending retry
+  boot();
+});
+window.addEventListener("yt-page-data-updated", () => {
+  clearTimeout(bootRetryTimer);  // Cancel any pending retry
+  boot();
+});
+
+// Fallback: If button doesn't appear, retry after 2 seconds
+// This handles cases where YouTube's DOM loads slowly
+window.addEventListener("yt-navigate-finish", () => {
+  clearTimeout(bootRetryTimer);
+  bootRetryTimer = setTimeout(() => {
+    const buttonExists = document.getElementById(ROOT_ID);
+    if (!buttonExists && location.pathname.startsWith("/watch")) {
+      console.log("[YT Transcript] Button not found after navigation, retrying boot...");
+      boot();
+    }
+  }, 2000);
+});
 
 // Listen for captured timedtext data from background
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -24,23 +44,52 @@ async function boot() {
 
     ensureInjected();
 
+    // Wait longer for YouTube's dynamic DOM to load
     const actionBar = await waitForAnySelector(
       [
         "ytd-watch-metadata #top-level-buttons-computed",
         "#info #menu #top-level-buttons-computed",
         "ytd-video-primary-info-renderer #top-level-buttons-computed"
       ],
-      6000
+      10000  // Increased from 6s to 10s
     );
 
-    if (!actionBar) return;
+    if (!actionBar) {
+      console.log("[YT Transcript] Action bar not found, will retry on next navigation");
+      return;
+    }
 
     const ui = mountUI(actionBar);
-    const data = await requestCaptionData();
+    
+    // Try to get caption data with retries
+    let data = null;
+    let attempts = 0;
+    const maxAttempts = 3;
+    
+    while (!data && attempts < maxAttempts) {
+      attempts++;
+      try {
+        data = await requestCaptionData(3000);  // Increased timeout to 3s
+        break;
+      } catch (e) {
+        console.log(`[YT Transcript] Caption data request failed (attempt ${attempts}/${maxAttempts}):`, e.message);
+        if (attempts < maxAttempts) {
+          // Wait before retrying (exponential backoff)
+          await new Promise(resolve => setTimeout(resolve, 500 * attempts));
+        }
+      }
+    }
 
-    updateUI(ui, data);
-  } catch {
-    // no-op: YouTube DOM is volatile; we fail gracefully
+    // Show UI even if caption data failed - user can still try clicking the button
+    if (!data) {
+      console.log("[YT Transcript] Could not get caption data, showing empty UI");
+      // Pass empty caption tracks so UI is mounted but hidden (normal behavior)
+      updateUI(ui, { captionTracks: [], title: "youtube_transcript" });
+    } else {
+      updateUI(ui, data);
+    }
+  } catch (e) {
+    console.error("[YT Transcript] Boot failed:", e);
   }
 }
 
@@ -54,7 +103,7 @@ function ensureInjected() {
   (document.head || document.documentElement).appendChild(s);
 }
 
-function requestCaptionData(timeoutMs = 2000) {
+function requestCaptionData(timeoutMs = 3000) {  // Increased default from 2s to 3s
   return new Promise((resolve, reject) => {
     const reqId = crypto.randomUUID();
     const t = setTimeout(() => {
@@ -74,6 +123,46 @@ function requestCaptionData(timeoutMs = 2000) {
 
     window.addEventListener("message", onMsg);
     window.postMessage({ type: "YT_CAPTION_DATA_REQUEST", reqId }, "*");
+  });
+}
+
+function restoreButtonHandler(ui) {
+  const { track, btn, msg, shadow } = ui;
+  
+  // Remove any existing listener by cloning the button
+  const newBtn = btn.cloneNode(true);
+  btn.parentNode.replaceChild(newBtn, btn);
+  
+  // Update reference
+  ui.btn = newBtn;
+  
+  // Add the normal download handler
+  newBtn.addEventListener("click", async () => {
+    try {
+      newBtn.disabled = true;
+      track.disabled = true;
+      msg.textContent = "Please turn on captions...";
+
+      const opt = track.selectedOptions[0];
+      const title = opt?.dataset?.title || "youtube_transcript";
+      const languageCode = opt?.dataset?.lang || "lang";
+
+      // Enable interception in background
+      await chrome.runtime.sendMessage({ type: "ENABLE_INTERCEPTION" });
+      console.log("[YT Transcript] Interception enabled - please turn on captions in video player");
+
+      // Store UI context for later
+      window.__ytTranscriptUI = { title, languageCode, btn: newBtn, track, msg };
+      awaitingCapture = true;
+
+      // Show instructions to user
+      msg.textContent = "👆 Turn on captions (CC button) to capture transcript";
+
+    } catch (e) {
+      msg.textContent = String(e?.message || e);
+      newBtn.disabled = false;
+      track.disabled = false;
+    }
   });
 }
 
